@@ -2,8 +2,10 @@ package com.aptoglobal.playground
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
@@ -37,6 +39,7 @@ class MainActivity : AppCompatActivity() {
     private var writePermissionGranted = false
 
     private lateinit var permissionsLauncher: ActivityResultLauncher<Array<String>>
+    private lateinit var contentObserver: ContentObserver
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,23 +49,31 @@ class MainActivity : AppCompatActivity() {
         permissionsLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             readPermissionGranted = permissions[Manifest.permission.READ_EXTERNAL_STORAGE] ?: readPermissionGranted
             writePermissionGranted = permissions[Manifest.permission.WRITE_EXTERNAL_STORAGE] ?: writePermissionGranted
+
+            if (readPermissionGranted) {
+                renderPhotosFromExternalStorage()
+            } else {
+                Toast.makeText(this, "Can't read files without permission", Toast.LENGTH_LONG).show()
+            }
         }
         updateOrRequestPermissions()
 
         val takePhoto = registerForActivityResult(ActivityResultContracts.TakePicturePreview()) {
-            val isPrivate = binding.switchPrivate.isChecked
-            val isSavedSuccessfully = when {
-                isPrivate -> savePhotoToInternalStorage(UUID.randomUUID().toString(), it)
-                writePermissionGranted -> savePhotoToExternalStorage(UUID.randomUUID().toString(), it)
-                else -> false
-            }
-            if (isPrivate) {
-                renderPhotosFromInternalStorage()
-            }
-            if (isSavedSuccessfully) {
-                Toast.makeText(this, "Photo saved successfully", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "Failed to save photo", Toast.LENGTH_SHORT).show()
+            lifecycleScope.launch {
+                val isPrivate = binding.switchPrivate.isChecked
+                val isSavedSuccessfully = when {
+                    isPrivate -> savePhotoToInternalStorage(UUID.randomUUID().toString(), it)
+                    writePermissionGranted -> savePhotoToExternalStorage(UUID.randomUUID().toString(), it)
+                    else -> false
+                }
+                if (isPrivate) {
+                    renderPhotosFromInternalStorage()
+                }
+                if (isSavedSuccessfully) {
+                    Toast.makeText(this@MainActivity, "Photo saved successfully", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this@MainActivity, "Failed to save photo", Toast.LENGTH_SHORT).show()
+                }
             }
         }
 
@@ -72,6 +83,74 @@ class MainActivity : AppCompatActivity() {
 
         initializeInternalPhotosRecyclerView()
         renderPhotosFromInternalStorage()
+
+        initializeExternalPhotosRecyclerView()
+        initContentObserver()
+        renderPhotosFromExternalStorage()
+    }
+
+    private fun initContentObserver() {
+        contentObserver = object : ContentObserver(null) {
+            override fun onChange(selfChange: Boolean) {
+                if (readPermissionGranted) {
+                    renderPhotosFromExternalStorage()
+                }
+            }
+        }
+        contentResolver.registerContentObserver(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            true,
+            contentObserver
+        )
+    }
+
+    private fun renderPhotosFromExternalStorage() {
+        lifecycleScope.launch {
+            val photos = loadPhotosFromExternalStorage()
+            externalPhotosAdapter.submitList(photos)
+        }
+    }
+
+    private fun initializeExternalPhotosRecyclerView() = binding.rvPublicPhotos.run {
+        adapter = externalPhotosAdapter
+        layoutManager = StaggeredGridLayoutManager(3, RecyclerView.VERTICAL)
+    }
+
+    private suspend fun loadPhotosFromExternalStorage(): List<SharedStoragePhoto> {
+        return withContext(Dispatchers.IO) {
+            val collection = doIfSdk29OrUpOrNull {
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            } ?: MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+
+            val photos = mutableListOf<SharedStoragePhoto>()
+            contentResolver.query(
+                collection,
+                arrayOf(
+                    MediaStore.Images.Media._ID,
+                    MediaStore.Images.Media.DISPLAY_NAME,
+                    MediaStore.Images.Media.WIDTH,
+                    MediaStore.Images.Media.HEIGHT
+                ),
+                null,
+                null,
+                "${MediaStore.Images.Media.DISPLAY_NAME} ASC"
+            )?.use { cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val displayNameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+                val widthColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
+                val heightColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
+
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idColumn)
+                    val displayName = cursor.getString(displayNameColumn)
+                    val width = cursor.getInt(widthColumn)
+                    val height = cursor.getInt(heightColumn)
+                    val contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+                    photos.add(SharedStoragePhoto(id, displayName, width, height, contentUri))
+                }
+            }
+            photos
+        }
     }
 
     private fun updateOrRequestPermissions() {
@@ -97,7 +176,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     @SuppressLint("InlinedApi")
-    private fun savePhotoToExternalStorage(displayName: String, bitmap: Bitmap): Boolean {
+    private suspend fun savePhotoToExternalStorage(displayName: String, bitmap: Bitmap): Boolean = withContext(Dispatchers.IO) {
         val imageCollection = doIfSdk29OrUpOrNull {
             MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         } ?: MediaStore.Images.Media.EXTERNAL_CONTENT_URI
@@ -109,7 +188,7 @@ class MainActivity : AppCompatActivity() {
             put(MediaStore.Images.Media.HEIGHT, bitmap.height)
         }
 
-        return try {
+        try {
             contentResolver.insert(imageCollection, contentValues)?.also { uri ->
                 contentResolver.openOutputStream(uri).use { outputStream ->
                     if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 100, outputStream)) {
@@ -136,8 +215,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun deletePhotoFromInternalStorage(filename: String): Boolean {
-        return try {
+    private suspend fun deletePhotoFromInternalStorage(filename: String): Boolean = withContext(Dispatchers.IO) {
+        try {
             deleteFile(filename)
         } catch (e: Exception) {
             e.printStackTrace()
@@ -156,8 +235,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun savePhotoToInternalStorage(filename: String, bitmap: Bitmap): Boolean {
-        return try {
+    private suspend fun savePhotoToInternalStorage(filename: String, bitmap: Bitmap): Boolean = withContext(Dispatchers.IO) {
+        try {
             openFileOutput("$filename.jpg", MODE_PRIVATE).use { stream ->
                 if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream)) {
                     throw IOException("Couldn't save bitmap.")
@@ -170,13 +249,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun onPhotoClick(photo: InternalStoragePhoto) {
+    private fun onPhotoClick(photo: InternalStoragePhoto) = lifecycleScope.launch {
         val isDeletedSuccessfully = deletePhotoFromInternalStorage(photo.name)
         if (isDeletedSuccessfully) {
             renderPhotosFromInternalStorage()
-            Toast.makeText(this, "Photo deleted successfully", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@MainActivity, "Photo deleted successfully", Toast.LENGTH_SHORT).show()
         } else {
-            Toast.makeText(this, "Failed to delete photo", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@MainActivity, "Failed to delete photo", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    override fun onDestroy() {
+        contentResolver.unregisterContentObserver(contentObserver)
+        super.onDestroy()
     }
 }
